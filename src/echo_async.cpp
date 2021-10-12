@@ -14,7 +14,7 @@
 #include <cstring>
 
 #define PORT                8080
-#define SIZEOF_READ 32
+#define BUFFER_SIZE 32
 static struct io_uring ioUring;
 static struct sockaddr_in serverAddress;
 static bool isNewRequestRequired{true};
@@ -84,7 +84,9 @@ void mainLoop(int socketDescriptor) {
     struct io_uring_sqe *sqe;
     std::shared_ptr<Request> request;
     while (true) {
+        printf("next iteration\n");
         if (isNewRequestRequired) {
+            printf("accepting new connection\n");
             request = Request::makeRequest();
             sqe = io_uring_get_sqe(&ioUring);
             io_uring_prep_accept(sqe, socketDescriptor, (sockaddr *) request->clientAddress.get(),
@@ -107,7 +109,7 @@ void mainLoop(int socketDescriptor) {
                 sqe = io_uring_get_sqe(&ioUring);
                 response->eventType = RequestType::READ;
                 response->clientSocket = cqe->res;
-                response->allocateBuffer(SIZEOF_READ);
+                response->allocateBuffer(BUFFER_SIZE);
                 io_uring_prep_readv(sqe, response->clientSocket, &(response->buffer), 1, 0);
                 io_uring_sqe_set_data(sqe, response.get());
                 io_uring_submit(&ioUring);
