@@ -19,9 +19,9 @@ static struct io_uring ioUring;
 static struct sockaddr_in serverAddress;
 static bool isNewRequestRequired{true};
 enum class RequestType {
-    ACCEPT,
-    READ,
-    WRITE
+    ACCEPT_CONN,
+    READ_SOCKET,
+    WRITE_SOCKET
 };
 
 struct Request {
@@ -37,7 +37,7 @@ struct Request {
     }
 
     static Request *makeRequest() {
-        return new Request(RequestType::ACCEPT);
+        return new Request(RequestType::ACCEPT_CONN);
     };
 
     void allocateBuffer(int size) {
@@ -92,18 +92,18 @@ void mainLoop(int socketDescriptor) {
         auto response = (Request *) io_uring_cqe_get_data(cqe);
         if (cqe->res < 0) {
             printf("%s type %d failed!\n", response, response->eventType);
-            if (response->eventType == RequestType::ACCEPT) isNewRequestRequired = true;
+            if (response->eventType == RequestType::ACCEPT_CONN) isNewRequestRequired = true;
             delete response;
             io_uring_cqe_seen(&ioUring, cqe);
             continue;
         }
         switch (response->eventType) {
-            case RequestType::ACCEPT:
+            case RequestType::ACCEPT_CONN:
                 isNewRequestRequired = true;
                 printf("new connection accepted from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
 //                submit read request
                 sqe = io_uring_get_sqe(&ioUring);
-                response->eventType = RequestType::READ;
+                response->eventType = RequestType::READ_SOCKET;
                 (response->clientSocket) = cqe->res;
                 response->allocateBuffer(BUFFER_SIZE);
                 io_uring_prep_readv(sqe, response->clientSocket, &(response->buffer), 1, 0);
@@ -111,17 +111,17 @@ void mainLoop(int socketDescriptor) {
                 io_uring_submit(&ioUring);
                 printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
                 break;
-            case RequestType::READ:
+            case RequestType::READ_SOCKET:
 //                ignoring failed request
                 printf("read %d bytes from %s:%d\n", response->buffer.iov_len, inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port));
-                response->eventType = RequestType::WRITE;
+                response->eventType = RequestType::WRITE_SOCKET;
                 sqe = io_uring_get_sqe(&ioUring);
                 io_uring_prep_writev(sqe, response->clientSocket, &(response->buffer), 1, 0);
                 io_uring_sqe_set_data(sqe, response);
                 io_uring_submit(&ioUring);
                 printf("wrote buffer back to %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port));
                 break;
-            case RequestType::WRITE:
+            case RequestType::WRITE_SOCKET:
                 printf("%s:%d event %d\n",  inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port), response->eventType);
                 close(response->clientSocket);
                 delete response;
