@@ -9,13 +9,17 @@
 #include <netinet/in.h>
 
 #include <thread>
-#include <unistd.h>
 #include <arpa/inet.h>
 #include <cstring>
 #include <map>
+#include <fcntl.h>
+#include <sstream>
+
+using std::string;
 
 #define PORT                8080
 #define BUFFER_SIZE 32
+#define DIRNAME "/tmp/mkoshel/"
 static struct io_uring ioUring;
 static struct sockaddr_in serverAddress;
 static bool isNewRequestRequired{true};
@@ -23,15 +27,19 @@ enum class RequestType {
     ACCEPT_CONN,
     READ_SOCKET,
     WRITE_SOCKET,
-    WRITE_FD
+    OPEN_FILE,
+    WRITE_FILE,
+    CLOSE_FILE
 };
 
 struct Request {
     RequestType eventType;
     int clientSocket{-1};
+    int fileDescriptor{-1};
     sockaddr_in clientAddress;
     int clientAddressSize{sizeof clientAddress};
     iovec buffer;
+
 
     Request(RequestType type) : eventType{type} { }
     ~Request() {
@@ -73,11 +81,11 @@ int setup_server(int port) {
     return socketDescriptor;
 }
 
-void mainLoop(int socketDescriptor) {
-    int clientSocket{-1};
+void mainLoop(int socketDescriptor, int directoryFd) {
     struct io_uring_cqe *cqe;
     struct io_uring_sqe *sqe;
     Request *request;
+    char filePath[32];
     while (true) {
         printf("new iteration\n");
         if (isNewRequestRequired) {
@@ -90,31 +98,58 @@ void mainLoop(int socketDescriptor) {
             io_uring_submit(&ioUring);
             isNewRequestRequired = false;
         }
-        if (io_uring_peek_cqe(&ioUring, &cqe) < 0 ) io_uring_wait_cqe(&ioUring, &cqe);
+        if (io_uring_peek_cqe(&ioUring, &cqe) == -EAGAIN ) io_uring_wait_cqe(&ioUring, &cqe);
         auto response = (Request *) io_uring_cqe_get_data(cqe);
+        if (cqe->res < 0) {
+            if (response->eventType == RequestType::ACCEPT_CONN) isNewRequestRequired = true;
+            printf("%d type %d failed! error %d\n", response, response->eventType, cqe->res);
+            delete response;
+            io_uring_cqe_seen(&ioUring, cqe);
+            continue;
+        }
         switch (response->eventType) {
             case RequestType::ACCEPT_CONN:
                 isNewRequestRequired = true;
                 printf("new connection accepted from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
 //                submit read request
-                sqe = io_uring_get_sqe(&ioUring);
-                response->eventType = RequestType::READ_SOCKET;
                 (response->clientSocket) = cqe->res;
+                sqe = io_uring_get_sqe(&ioUring);
+                response->eventType = RequestType::OPEN_FILE;
+                memset(filePath, 0, sizeof filePath);
+                sprintf(filePath, "%d", response);
+                io_uring_prep_openat(sqe, directoryFd,filePath,O_RDWR| O_CREAT | O_NONBLOCK, 0777);
+                io_uring_sqe_set_data(sqe, response);
+                io_uring_submit(&ioUring);
+                printf("requesting to open a file %s\n", filePath);
+                break;
+            case RequestType::OPEN_FILE:
+                response->fileDescriptor = cqe->res;
+                printf("file opened! fd is %d\n", response->fileDescriptor);
+                response->eventType = RequestType::READ_SOCKET;
                 response->allocateBuffer(BUFFER_SIZE);
+                sqe = io_uring_get_sqe(&ioUring);
                 io_uring_prep_readv(sqe, response->clientSocket, &(response->buffer), 1, 0);
                 io_uring_sqe_set_data(sqe, response);
                 io_uring_submit(&ioUring);
                 printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
                 break;
             case RequestType::READ_SOCKET:
-//                ignoring failed request
                 printf("read %d bytes from %s:%d\n", response->buffer.iov_len, inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port));
-                response->eventType = RequestType::WRITE_SOCKET;
+                response->eventType = RequestType::WRITE_FILE;
                 sqe = io_uring_get_sqe(&ioUring);
-                io_uring_prep_writev(sqe, response->clientSocket, &(response->buffer), 1, 0);
+                io_uring_prep_writev(sqe, response->fileDescriptor, &(response->buffer), 1, 0);
                 io_uring_sqe_set_data(sqe, response);
                 io_uring_submit(&ioUring);
-                printf("requested to write buffer back to %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port));
+                printf("requested to write buffer into file %s\n", response);
+                break;
+            case RequestType::WRITE_FILE:
+                printf("echo written into file %d!\n",  response);
+                response->eventType = RequestType::WRITE_SOCKET;
+                sqe = io_uring_get_sqe(&ioUring);
+                io_uring_prep_writev(sqe, response->clientSocket, &(response->buffer), 1, sizeof response->buffer);
+                io_uring_sqe_set_data(sqe, response);
+                io_uring_submit(&ioUring);
+                printf("request to write data back to %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
                 break;
             case RequestType::WRITE_SOCKET:
                 printf("%s:%d echo sent!\n",  inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port), response->eventType);
@@ -125,6 +160,7 @@ void mainLoop(int socketDescriptor) {
                 io_uring_submit(&ioUring);
                 printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
                 break;
+
             default:
                 printf("unknown response\n");
         }
@@ -133,6 +169,17 @@ void mainLoop(int socketDescriptor) {
 
     }
 }
+int makeDirectory(string dirName) {
+    std::stringstream ss;
+    ss << "mkdir -p " << dirName;
+    int result;
+    result = system(ss.str().c_str());
+    if (result < 0 ) fatal_error("could not make a directory!");
+    result  = open(dirName.c_str(), O_DIRECTORY | O_RDONLY);
+    if (result < 0 ) fatal_error("could not open a directory!!!");
+    return  result;
+}
+
 
 
 int main(int argc, char *argv[]) {
@@ -145,8 +192,8 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, [](int signalNumber) {
         printf("SIGPIPE caught!\n");
     });
-
+    auto directoryFd = makeDirectory(DIRNAME);
     io_uring_queue_init(256, &ioUring, 0);
-    mainLoop(server_socket);
+    mainLoop(server_socket, directoryFd);
     return 0;
 }
