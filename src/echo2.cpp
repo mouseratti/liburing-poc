@@ -81,6 +81,18 @@ struct Request {
         printf("request to read data from  %s\n", toString().c_str());
     }
 
+    void askOpenFile(io_uring * ring, int directoryFd) {
+        eventType = RequestType::OPEN_FILE;
+        char filePath[32];
+        memset(filePath, 0, sizeof filePath);
+        sprintf(filePath, "%s", toString().c_str());
+        auto  sqe = io_uring_get_sqe(ring);
+        io_uring_prep_openat(sqe, directoryFd, filePath,O_RDWR| O_CREAT | O_NONBLOCK, 0777);
+        io_uring_sqe_set_data(sqe, this);
+        io_uring_submit(&ioUring);
+        printf("requesting to open a file %s\n", filePath);
+    }
+
 
     string toString() {
         char buffer[32];
@@ -117,7 +129,6 @@ void mainLoop(int socketDescriptor, int directoryFd) {
     struct io_uring_cqe *cqe;
     struct io_uring_sqe *sqe;
     Request *request;
-    char filePath[32];
     while (true) {
         printf("new iteration\n");
         if (isNewRequestRequired) {
@@ -144,15 +155,8 @@ void mainLoop(int socketDescriptor, int directoryFd) {
                 isNewRequestRequired = true;
                 printf("new connection accepted from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
 //                submit read request
-                (response->clientSocket) = cqe->res;
-                sqe = io_uring_get_sqe(&ioUring);
-                response->eventType = RequestType::OPEN_FILE;
-                memset(filePath, 0, sizeof filePath);
-                sprintf(filePath, "%d", response);
-                io_uring_prep_openat(sqe, directoryFd,filePath,O_RDWR| O_CREAT | O_NONBLOCK, 0777);
-                io_uring_sqe_set_data(sqe, response);
-                io_uring_submit(&ioUring);
-                printf("requesting to open a file %s\n", filePath);
+                response->clientSocket = cqe->res;
+                response->askOpenFile(&ioUring, directoryFd);
                 break;
             case RequestType::OPEN_FILE:
                 response->fileDescriptor = cqe->res;
@@ -174,23 +178,16 @@ void mainLoop(int socketDescriptor, int directoryFd) {
                 break;
             case RequestType::WRITE_SOCKET:
                 printf("%s:%d echo sent!\n",  inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port), response->eventType);
-                response->eventType = RequestType::READ_SOCKET;
-                sqe = io_uring_get_sqe(&ioUring);
-                io_uring_prep_readv(sqe, response->clientSocket, &(response->buffer), 1, 0);
-                io_uring_sqe_set_data(sqe, response);
-                io_uring_submit(&ioUring);
-                printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
+                response->askReadSocket(&ioUring);
                 break;
             case RequestType::CLOSE_SOCKET:
-                printf("socket  %s:%d closed by the server!\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
+                printf("%s closed by the server!\n", response->toString().c_str());
                 delete response;
                 break;
             default:
                 printf("unknown response\n");
         }
         io_uring_cqe_seen(&ioUring, cqe);
-        printf("end of current iteration\n");
-
     }
 }
 int makeDirectory(string dirName) {
