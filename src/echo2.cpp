@@ -7,7 +7,6 @@
 #include <liburing.h>
 #include <string>
 #include <netinet/in.h>
-
 #include <thread>
 #include <arpa/inet.h>
 #include <cstring>
@@ -29,7 +28,8 @@ enum class RequestType {
     WRITE_SOCKET,
     OPEN_FILE,
     WRITE_FILE,
-    CLOSE_FILE
+    CLOSE_FILE,
+    CLOSE_SOCKET,
 };
 
 struct Request {
@@ -51,9 +51,41 @@ struct Request {
     };
 
     void allocateBuffer(int size) {
+        if (buffer.iov_base != nullptr) return;
         buffer.iov_base = malloc(size);
         memset(buffer.iov_base, 0, size);
         buffer.iov_len = (size_t) size;
+    }
+    void askCloseSocket(io_uring* ring) {
+        auto sqe = io_uring_get_sqe(ring);
+        this->eventType = RequestType::CLOSE_SOCKET;
+        io_uring_prep_close(sqe, clientSocket);
+        io_uring_sqe_set_data(sqe, this);
+        io_uring_submit(ring);
+    }
+    void askWriteSocket(io_uring* ring) {
+        eventType = RequestType::WRITE_SOCKET;
+        auto sqe = io_uring_get_sqe(ring);
+        io_uring_prep_writev(sqe, clientSocket, &buffer, 1, 0);
+        io_uring_sqe_set_data(sqe, this);
+        io_uring_submit(&ioUring);
+        printf("request to write data back to %s\n", toString().c_str());
+    }
+    void askReadSocket(io_uring* ring) {
+        eventType = RequestType::READ_SOCKET;
+        auto sqe = io_uring_get_sqe(ring);
+        this->allocateBuffer(BUFFER_SIZE);
+        io_uring_prep_readv(sqe, clientSocket, &buffer, 1, 0);
+        io_uring_sqe_set_data(sqe, this);
+        io_uring_submit(&ioUring);
+        printf("request to read data from  %s\n", toString().c_str());
+    }
+
+
+    string toString() {
+        char buffer[32];
+        sprintf(buffer,"%s:%d type %d", inet_ntoa(clientAddress.sin_addr), htons(clientAddress.sin_port), eventType);
+        return string{buffer};
     }
 };
 //static std::map<long,Request*> activeRequests;
@@ -102,8 +134,8 @@ void mainLoop(int socketDescriptor, int directoryFd) {
         auto response = (Request *) io_uring_cqe_get_data(cqe);
         if (cqe->res < 0) {
             if (response->eventType == RequestType::ACCEPT_CONN) isNewRequestRequired = true;
-            printf("%d type %d failed! error %d\n", response, response->eventType, cqe->res);
-            delete response;
+            printf("%s fail! error %d\n", response->toString().c_str(), cqe->res);
+            response->askCloseSocket(&ioUring);
             io_uring_cqe_seen(&ioUring, cqe);
             continue;
         }
@@ -125,13 +157,7 @@ void mainLoop(int socketDescriptor, int directoryFd) {
             case RequestType::OPEN_FILE:
                 response->fileDescriptor = cqe->res;
                 printf("file opened! fd is %d\n", response->fileDescriptor);
-                response->eventType = RequestType::READ_SOCKET;
-                response->allocateBuffer(BUFFER_SIZE);
-                sqe = io_uring_get_sqe(&ioUring);
-                io_uring_prep_readv(sqe, response->clientSocket, &(response->buffer), 1, 0);
-                io_uring_sqe_set_data(sqe, response);
-                io_uring_submit(&ioUring);
-                printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
+                response->askReadSocket(&ioUring);
                 break;
             case RequestType::READ_SOCKET:
                 printf("read %d bytes from %s:%d\n", response->buffer.iov_len, inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port));
@@ -144,12 +170,7 @@ void mainLoop(int socketDescriptor, int directoryFd) {
                 break;
             case RequestType::WRITE_FILE:
                 printf("echo written into file %d!\n",  response);
-                response->eventType = RequestType::WRITE_SOCKET;
-                sqe = io_uring_get_sqe(&ioUring);
-                io_uring_prep_writev(sqe, response->clientSocket, &(response->buffer), 1, sizeof response->buffer);
-                io_uring_sqe_set_data(sqe, response);
-                io_uring_submit(&ioUring);
-                printf("request to write data back to %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
+                response->askWriteSocket(&ioUring);
                 break;
             case RequestType::WRITE_SOCKET:
                 printf("%s:%d echo sent!\n",  inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port), response->eventType);
@@ -160,7 +181,10 @@ void mainLoop(int socketDescriptor, int directoryFd) {
                 io_uring_submit(&ioUring);
                 printf("waiting for data from %s:%d\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
                 break;
-
+            case RequestType::CLOSE_SOCKET:
+                printf("socket  %s:%d closed by the server!\n", inet_ntoa(response->clientAddress.sin_addr), htons(response->clientAddress.sin_port) );
+                delete response;
+                break;
             default:
                 printf("unknown response\n");
         }
